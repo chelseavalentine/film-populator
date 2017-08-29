@@ -7,7 +7,13 @@
             [populator.film-api.credits :as credits-fns]
             [populator.utils.time :as time]
             [populator.utils.general :refer :all]
-            [populator.db.films :as db-films]))
+            [populator.db.films :as db-films]
+            [populator.studio-populator :as studio-populator]
+            [populator.person-populator :as person-populator]
+            [clojure.set :as set]))
+
+(def processed-studios (atom {}))
+(def processed-people (atom {}))
 
 (defn setup-film-titles
   "Processes film titles and returns updated film data. Returns nil if the
@@ -115,17 +121,18 @@
   (let [response (extract-map response)
         film     (extract-map film)]
     (when (and response film)
-      (if-let [studio-tmdb-ids (not-empty (filter some? (extract-property-items response :production_companies :id)))]
+      (when-let [studio-tmdb-ids (not-empty (filter some? (extract-property-items response :production_companies :id)))]
         (let [film-id        (extract-number film :id)
               studio-queries (doall (map (fn [tmdb-id] {:tmdb_id tmdb-id}) studio-tmdb-ids))
               studios        (studio-fns/find-or-create-studios studio-queries)
               studio-ids     (not-empty (filter some? (map #(extract-number % :id) studios)))]
-          (if studio-ids
-            (do
-              (doall (map #(studio-film-fns/find-or-create-studio-film % film) studio-ids))
-              (studio-fns/update-film-studios film-id studio-ids))
-            film))
-        film))))
+          (when studio-ids
+            (studio-fns/update-film-studios film-id studio-ids)))
+        (if-let [unprocessed-studio-ids (not-empty (filter #(not (contains? @processed-studios %)) studio-tmdb-ids))]
+          (do
+            (swap! processed-studios set/union unprocessed-studio-ids)
+            (studio-populator/get-studio-films unprocessed-studio-ids))
+          {})))))
 
 (defn create-film-credits
   "Processes film credits and creates the people and cast member
@@ -134,13 +141,13 @@
   (let [response (extract-map response)
         film     (extract-map film)]
     (when (and response film)
-      (if-let [credits (extract-map response :credits)]
-        (let [cast-member-data    (extract-coll credits :cast)
-              crew-member-data    (extract-coll credits :crew)
-              credits-people-data (concat cast-member-data crew-member-data)
-              people-ids          (vec (set (doall (map #(extract-number % :id) credits-people-data))))
-              people-queries      (map (fn [tmdb-id] {:tmdb_id tmdb-id}) people-ids)]
-          (when people-ids
+      (when-let [credits (extract-map response :credits)]
+        (let [cast-member-data (extract-coll credits :cast)
+              crew-member-data (extract-coll credits :crew)
+              people-data      (concat cast-member-data crew-member-data)
+              person-ids       (vec (set (doall (map #(extract-number % :id) people-data))))
+              people-queries   (map (fn [tmdb-id] {:tmdb_id tmdb-id}) person-ids)]
+          (when person-ids
             (let [people       (person-fns/find-or-create-people people-queries)
                   cast-members (credits-fns/find-or-create-cast film cast-member-data)
                   crew-members (credits-fns/find-or-create-crew film crew-member-data)
@@ -148,8 +155,12 @@
                   director-ids (not-empty (filter some? (map #(extract-number % :id) directors)))
                   film-id      (extract-number film :id)]
               (when director-ids
-                (credits-fns/update-directors film-id director-ids)))))
-        film))))
+                (credits-fns/update-directors film-id director-ids)))
+            (if-let [unprocessed-person-ids (not-empty (filter #(not (contains? @processed-people %)) person-ids))]
+              (do
+                (swap! processed-people set/union unprocessed-person-ids)
+                (person-populator/get-people-films unprocessed-person-ids))
+              {})))))))
 
 (defn create-film
   "Creates a film record in the database."
@@ -163,5 +174,6 @@
         (when-let [data (create-film-data response)]
           (let [film (or existing-film (db-films/create-film data))]
             (create-film-images response film)
-            (create-film-studios response film)
-            (create-film-credits response film)))))))
+            (let [related-studio-film-ids (create-film-studios response film)
+                  related-person-film-ids (create-film-credits response film)]
+              (set/union (set related-studio-film-ids) (set related-person-film-ids)))))))))
